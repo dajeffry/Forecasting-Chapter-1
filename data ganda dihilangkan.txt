@@ -1,0 +1,155 @@
+library(tidyverse)
+library(readxl)
+library(fpp3)
+
+# Load and Transform ----
+dt <- read_excel("Data/Data Kerja Praktik.XLSX", sheet = "FINAL", skip = 1) %>%
+  select("material" = `Short text`, "harga" = Harga, "tingkat_kekritisan" = `Tingkat kekritisan`, "rutin_nonrutin" = `Rutin/Non Rutin`, Jan:Des, `2014`:`2018`, `2019` = `2019...30`, "ROQ" = ROQ)
+dt <- dt[2:(nrow(dt)-2),]
+
+is.na(dt)
+summary(dt)
+dt <- na.omit(dt)
+
+dt <- dt %>%
+  group_by(material) %>% 
+  slice_min(order_by = harga, n = 1) %>% 
+  distinct(material, .keep_all = T)
+
+dt %>% 
+  count(material) %>% 
+  arrange(desc(n))
+
+yearly <- dt |>
+  select(material, `2014`:`2019`) |>
+  pivot_longer(`2014`:`2019`, names_to = "tahun", values_to = "n") |>
+  mutate(tahun = as.integer(tahun)) |>
+  arrange(tahun, material) |>
+  distinct(tahun, material, .keep_all = T) |>
+  as_tsibble(index = tahun, key = material)
+
+dt %>%
+  na.omit() %>%
+  select(material, ROQ) %>%
+  pivot_longer(ROQ, names_to = ".model", values_to = "RMSE") %>%
+  bind_rows(akurasi) %>%
+  group_by(.model) %>%
+  summarise(mean(RMSE))
+write_csv(dt, "dt.csv")
+
+
+# Split training = 6, test = 1 ----
+train_ts <- yearly %>%
+  group_by_key(material) %>%
+  slice(1:5)
+test_ts <- yearly %>%
+  group_by_key(material) %>%
+  slice(6)
+
+train_ts
+test_ts
+
+# Fitting Model ----
+model_fit <- train_ts %>%
+  model(
+    croston = CROSTON(n, type = "croston"),
+    sba = CROSTON(n, type = "sba"),
+    arima = ARIMA(n),
+    ets = ETS(n)
+  )
+
+model_fit
+
+# Filter material dengan nilai null pada semua model ----
+not_null_model <- model_fit |>
+  filter(!is_null_model(sba) | !is_null_model(croston) | 
+           !is_null_model(arima) | is_null_model(ets))
+
+# Menghitung Akurasi ----
+akurasi <- forecast(not_null_model, h = 2) %>%
+  accuracy(test_ts) %>%
+  select(.model, material, RMSE)
+
+akurasi_summary <- akurasi |>
+  na.omit() |>
+  group_by(.model) |>
+  summarise(RMSE_mean = mean(RMSE))
+
+write_csv(dt, "Data/dt.csv")
+dt_2 <- read_excel("Data/dt.xlsx")
+
+dt_2 %>%
+  na.omit() %>%
+  select(material, ROQ.e) %>%
+  pivot_longer(ROQ.e, names_to = ".model", values_to = "RMSE") %>%
+  bind_rows(akurasi) %>%
+  group_by(.model) %>%
+  summarise(mean(RMSE))
+
+# Menghitung nilai ramalan ----
+peramalan <- forecast(not_null_model, h = 2)
+
+# Tabel report ----
+t1 <- peramalan %>%
+  as_tibble() %>%
+  filter(tahun == 2020) %>%
+  mutate(prediksi_2020 = paste0(.model, "_", as.character(tahun))) %>%
+  select(material, .mean, prediksi_2020) %>%
+  pivot_wider(names_from = prediksi_2020, values_from = .mean)
+
+t2 <- akurasi %>%
+  select(.model, material, RMSE) %>%
+  pivot_longer(RMSE, names_to = "matriks", values_to = "nilai_akurasi") %>%
+  mutate(model_akurasi = paste0(.model, "_", matriks)) %>%
+  select(material, nilai_akurasi, model_akurasi) %>%
+  pivot_wider(names_from = model_akurasi, values_from = nilai_akurasi)
+
+# masukin 2 model dan memilih model yang terbaik
+
+akurasi2 <- dt_2 %>%
+  select(material, ROQ.e) %>%
+  na.omit() %>%
+  pivot_longer(ROQ.e, names_to = ".model", values_to = "RMSE") %>%
+  bind_rows(akurasi) %>%
+  group_by(.model) %>%
+  summarise(mean(RMSE))
+
+akurasi3 <- akurasi2 %>%
+  group_by(material) %>%
+  slice_min(order_by = RMSE, n = 1) 
+
+akurasi2 %>%
+  group_by(material) %>%
+  slice_min(order_by = RMSE, n = 1) %>%
+  ungroup() %>%
+  distinct(material, .keep_all = TRUE) %>%
+  summarise(mean(RMSE))
+
+metode_optimal <- akurasi2 %>%
+  group_by(material) %>%
+  slice_min(order_by = RMSE, n = 1) %>%
+  ungroup() %>%
+  distinct(material, .keep_all = TRUE)
+
+mean(metode_optimal$RMSE)
+table(metode_optimal$.model)
+
+nilai_3_peramalan <- dt_2 %>%
+  select(material, ROQ) %>%
+  left_join(t1)
+
+nilai_3_peramalan %>%
+  pivot_longer(cols = 2:6, names_to = ".model", values_to = "nilai_prediksi") %>%
+  right_join(metode_optimal, by = c("material", ".model")) %>%
+  ungroup() %>%
+  arrange(.model)
+colSums(is.na(nilai_3_peramalan))
+
+result_forecast <- nilai_3_peramalan %>%
+  pivot_longer(cols = 2:6, names_to = ".model", values_to = "nilai_prediksi") %>%
+  mutate(.model = str_remove(.model, "_2020")) %>%
+  right_join(metode_optimal, by = c("material", ".model")) %>%
+  ungroup() %>%
+  arrange(.model)
+
+colSums(is.na(result_forecast))
