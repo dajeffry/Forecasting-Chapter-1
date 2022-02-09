@@ -1,0 +1,326 @@
+library(tidyverse)
+library(readxl)
+library(fpp3)
+library(dplyr)
+
+# Load and Transform ----
+dt2 <- read_excel("Data/Data Kerja Praktik.XLSX", sheet = "FINAL", skip = 1) %>%
+  select("material" = `Short text`, "harga" = Harga, "tingkat_kekritisan" = `Tingkat kekritisan`, "rutin_nonrutin" = `Rutin/Non Rutin`, Jan:Des, `2014`:`2018`, `2019` = `2019...30`, "ROQ" = ROQ)
+dt2 <- dt2[2:(nrow(dt2)-2),]
+
+write.csv(dt2, "Data/dt2.csv")
+
+
+# dt <- dt %>%
+#   group_by(material) %>% 
+#   slice_min(order_by = harga, n = 1) %>% 
+#   distinct(material, .keep_all = T)
+
+# dt <- na.omit(dt)
+# colSums(is.na(dt))
+
+dt <- dt2 %>%
+  group_by(material) %>% 
+  distinct(material, .keep_all = T)
+
+write.csv(dt, "Data/dt.csv")
+
+yearly <- dt %>%
+  select(material, `2014`:`2019`) %>%
+  pivot_longer(`2014`:`2019`, names_to = "tahun", values_to = "n") %>%
+  mutate(tahun = as.integer(tahun)) %>%
+  arrange(tahun, material) %>%
+  distinct(tahun, material, .keep_all = T) %>%
+  as_tsibble(index = tahun, key = material)
+
+write.csv(yearly, "Data/yearly.csv")
+
+colSums(is.na(yearly))
+is.na(dt)
+summary(dt)
+
+dt %>% 
+  count(material) %>% 
+  arrange(desc(n))
+
+dt %>%
+  na.omit() %>%
+  select(material, ROQ) %>%
+  pivot_longer(ROQ, names_to = ".model", values_to = "RMSE") %>%
+  bind_rows(akurasi) %>%
+  group_by(.model) %>%
+  summarise(mean(RMSE))
+write_csv(dt, "dt.csv")
+
+# Split training = 6, test = 1 ----
+train_ts <- yearly %>%
+  group_by_key(material) %>%
+  slice(1:5)
+test_ts <- yearly %>%
+  group_by_key(material) %>%
+  slice(6)
+
+train_ts
+test_ts
+
+write.csv(train_ts, "Data/train.csv")
+write.csv(test_ts, "Data/test.csv")
+
+
+# Fitting Model ----
+model_fit <- train_ts %>%
+  model(
+    croston = CROSTON(n, type = "croston"),
+    sba = CROSTON(n, type = "sba"),
+    arima = ARIMA(n),
+    ets = ETS(n)
+  )
+
+model_fit
+write.csv(model_fit, "Data/model.csv")
+
+# Filter material dengan nilai null pada semua model ----
+not_null_model <- model_fit %>%
+  filter(!is_null_model(sba) | !is_null_model(croston) | 
+           !is_null_model(arima) | is_null_model(ets))
+
+# Menghitung Akurasi ----
+akurasi <- forecast(not_null_model, h = 2) %>%
+  accuracy(test_ts) %>%
+  select(.model, material, RMSE)
+
+akurasi_summary <- akurasi %>%
+  na.omit() %>%
+  group_by(.model) %>%
+  summarise(RMSE_mean = mean(RMSE))
+
+dt_prep <- dt %>% 
+  select(1, "harga" = 2, "tingkat_kekritisan" = 3, "rutin_nonrutin" = 4, "2019" = 22, "ROQ" = 23)
+
+
+write_csv(dt_prep, "Data/dt_prep.csv")
+dt_prep <- read_excel("Data/dt_prep.xlsx")
+
+# colSums(is.na(dt_2))
+
+dt_prep %>%
+  na.omit() %>%
+  select(material, ROQ.e) %>%
+  pivot_longer(ROQ.e, names_to = ".model", values_to = "RMSE") %>%
+  bind_rows(akurasi) %>%
+  group_by(.model) %>%
+  summarise(mean(RMSE))
+
+# Menghitung nilai ramalan ----
+peramalan <- forecast(not_null_model, h = 2)
+
+# Tabel report ----
+t1 <- peramalan %>%
+  as_tibble() %>%
+  filter(tahun == 2020) %>%
+  mutate(prediksi_2020 = paste0(.model, "_", as.character(tahun))) %>%
+  select(material, .mean, prediksi_2020) %>%
+  pivot_wider(names_from = prediksi_2020, values_from = .mean)
+
+t2 <- akurasi %>%
+  select(.model, material, RMSE) %>%
+  pivot_longer(RMSE, names_to = "matriks", values_to = "nilai_akurasi") %>%
+  mutate(model_akurasi = paste0(.model, "_", matriks)) %>%
+  select(material, nilai_akurasi, model_akurasi) %>%
+  pivot_wider(names_from = model_akurasi, values_from = nilai_akurasi)
+
+# masukin 2 model dan memilih model yang terbaik
+
+akurasi2 <- dt_prep %>%
+  select(material, ROQ.e) %>%
+  na.omit() %>%
+  pivot_longer(ROQ.e, names_to = ".model", values_to = "RMSE") %>%
+  bind_rows(akurasi) %>%
+  group_by(.model) %>%
+  summarise(RMSE_mean = mean(RMSE))
+
+# PLot nilai error
+ggplot(akurasi2, aes(fct_reorder(.model, RMSE_mean), RMSE_mean)) +
+  geom_col() +
+  labs(title = "Plot Nilai Eror")
+
+akurasi2 <- dt_prep %>%
+  select(material, ROQ.e) %>%
+  na.omit() %>%
+  pivot_longer(ROQ.e, names_to = ".model", values_to = "RMSE") %>%
+  bind_rows(akurasi) %>%
+  group_by(.model)
+
+
+akurasi3 <- akurasi2 %>%
+  group_by(material) %>%
+  slice_min(order_by = RMSE, n = 1) 
+
+akurasi2 %>%
+  group_by(material) %>%
+  slice_min(order_by = RMSE, n = 1) %>%
+  ungroup() %>%
+  distinct(material, .keep_all = TRUE) %>%
+  summarise(mean(RMSE))
+
+metode_optimal <- akurasi2 %>%
+  group_by(material) %>%
+  slice_min(order_by = RMSE, n = 1) %>%
+  ungroup() %>%
+  distinct(material, .keep_all = TRUE)
+write.csv(metode_optimal, "Data/metode optimal.csv")
+
+
+mean(metode_optimal$RMSE)
+table(metode_optimal$.model)
+view(metode_optimal$.model)
+
+data <- select(t1, material)
+data <- dt_2 %>%
+  left_join(t1) %>%
+  arrange(material)
+
+nilai_3_peramalan <- dt_prep %>%
+  left_join(metode_optimal)
+
+nilai_3_peramalan <- dt_prep %>%
+  select(material, ROQ) %>%
+  left_join(t1)
+
+nilai_3_peramalan$ROQ <- as.numeric(nilai_3_peramalan$ROQ)
+
+nilai_3_peramalan %>%
+  pivot_longer(cols = 2:6, names_to = ".model", values_to = "nilai_prediksi") %>%
+  right_join(metode_optimal, by = c("material", ".model")) %>%
+  ungroup() %>%
+  arrange(.model)
+
+result_forecast <- nilai_3_peramalan %>%
+  pivot_longer(cols = 2:6, names_to = ".model", values_to = "nilai_prediksi") %>%
+  mutate(
+    .model = str_remove(.model, "_2020"), 
+    .model = str_replace(.model, "ROQ", "ROQ.e")) %>%
+  right_join(metode_optimal, by = c("material", ".model")) %>%
+  ungroup() %>%
+  arrange(.model)
+
+colSums(is.na(result_forecast))
+nrow(nilai_3_peramalan)
+nrow(metode_optimal)
+colSums(is.na(result_forecast))
+
+result_forecast2 <- result_forecast %>%
+  left_join(dt_2) %>%
+  select(material, harga, tingkat_kekritisan, ROQ, rutin_nonrutin, `2019`,
+         starts_with(".model"), starts_with("nilai_prediksi"))
+
+result_forecast2 <- result_forecast2 %>%
+  mutate(ROQ =
+           replace(ROQ,
+                   is.na(result_forecast2$ROQ),
+                   "0"))
+result_forecast2$ROQ <- as.numeric(result_forecast2$ROQ)
+result_forecast2$harga <- as.numeric(result_forecast2$harga)
+result_forecast2$nilai_prediksi <- ceiling(result_forecast2$nilai_prediksi)
+result_forecast2$ROQ <- ceiling(result_forecast2$ROQ)
+colSums(is.na(result_forecast2))
+write.csv(result_forecast2, "Data/result forecast2.csv")
+
+forecast2_arima <- filter(result_forecast2, .model == "arima")
+write_csv(forecast2_arima, "Data/forecast arima.csv")
+forecast2_croston <- filter(result_forecast2, .model == "croston")
+write_csv(forecast2_croston, "Data/forecast croston.csv")
+forecast2_ets <- filter(result_forecast2, .model == "ets")
+write_csv(forecast2_ets, "Data/forecast ets.csv")
+forecast2_sba <- filter(result_forecast2, .model == "sba")
+write_csv(forecast2_sba, "Data/forecast sba.csv")
+forecast2_roq <- filter(result_forecast2, .model == "ROQ.e")
+write_csv(forecast2_roq, "Data/forecast roq.csv")
+sum(result_forecast2$ROQ)
+sum(result_forecast2$`2019`)
+sum(result_forecast2$nilai_prediksi)
+table(result_forecast2$.model)
+write.csv(result_forecast2, "Data/Data hasil2.csv")
+
+
+## Perhitungan Anggaran'
+
+# Anggaran berdasarkan peramalan
+anggaran <- result_forecast2 %>% 
+  mutate(
+    anggaran_by_model = nilai_prediksi * harga,
+    anggaran_by_roq  = ROQ * harga,
+    anggaran_by_2019 = `2019` * harga
+    # anggaran_by_ROQ
+  ) %>% 
+  pivot_longer(
+    starts_with("anggaran_by"), 
+    names_to = "metode_ramalan", 
+    values_to = "hasil_peramalan"
+  ) %>% 
+  group_by(metode_ramalan) %>%
+  summarise(total_anggaran = sum(hasil_peramalan, na.rm = T))
+write.csv(anggaran, "Data/anggaran.csv")
+
+# SERVICE LEVEL
+service_level <- read_excel("Data/Data-hasil2 (1).xlsx")
+service_level <- service_level %>%
+  mutate(`service level` =
+           replace(`service level`,
+                   is.na(service_level$`service level`),
+                   "1"))
+
+service_level <- service_level %>%
+  mutate(`service level eksisting` =
+           replace(`service level eksisting`,
+                   is.na(service_level$`service level eksisting`),
+                   "1"))
+
+service_level$`service level` <- as.numeric(service_level$`service level`)
+service_level$`service level eksisting` <- as.numeric(service_level$`service level eksisting`)
+
+# harga pada "NA" ==> 0
+service_level$harga[service_level$harga == "NA"]
+service_level <- service_level %>%
+  mutate(harga =
+           replace(harga,
+                   harga == "NA",
+                   0))
+# tingkat kekritisan pada "NA" ==> 0
+service_level$tingkat_kekritisan[service_level$tingkat_kekritisan == "0"]
+service_level <- service_level %>%
+  mutate(tingkat_kekritisan =
+           replace(tingkat_kekritisan,
+                   tingkat_kekritisan == "0",
+                   "Unavailable"))
+
+colSums(is.na(service_level))
+write.csv(service_level, "Data/service level.csv")
+
+colSums(is.na(service_level))
+mean(service_level$`service level`)
+mean(service_level$`service level eksisting`)
+
+sl_over <- filter(service_level,
+                 `service level` > 1)
+sl_over_eks <- filter(service_level,
+                  `service level eksisting` > 1)
+mean(sl_over$`service level`)
+mean(sl_over_eks$`service level eksisting`)
+write.csv(sl_over, "Data/service level over (metode optimum).csv")
+write.csv(sl_over_eks, "Data/service level over (eksisting).csv")
+
+sl_target <- filter(service_level,
+                    `service level` <= 1)
+sl_target_eks <- filter(service_level,
+                    `service level eksisting` <= 1)
+
+
+mean(sl_target$`service level`)
+mean(sl_target_eks$`service level eksisting`)
+
+
+service_level <- arrange(service_level, desc(`service level`))
+
+
+write.csv(service_level, "Data/service level.csv")
