@@ -1,0 +1,387 @@
+---
+title: "Forecasting Time Series"
+author: "Daniel Jeffry"
+date: "10/20/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Description
+
+This reports provides material forecasting demand using Arima, Exponential Smoothing, Croston, and Syntetos Boyland Approximation method. The dataset using in this report for modeling is real case data in one of the state owned company in Indonesia.  
+
+The report as structured as follows:  
+1. Data Extraction  
+2. Exploratory Data Analysis  
+3. Data Preparation  
+4. Modeling  
+5. Evaluation  
+6. Conclusion      
+
+# 1. Data Extraction
+
+Import necessary libraries.
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(fpp3)
+library(dplyr)
+library(gridExtra)
+library(flexclust)
+```
+
+Library **readlxl**: for import excel files into R.  
+Library **tidyverse**: for select unique/distinct rows from data frame.      
+Library **fpp3**: for visualization of correlation coefficient matrix  
+Library **gridExtra**: for plotting multiple graphs. 
+Library **caret**: for One Hod Encoding
+
+For the next step, we can load the data and selecting relevant columns. Then, see the dataframe's structure.
+
+```{r}
+dt2 <- read_excel("Data/Data Kerja Praktik.XLSX", sheet = "FINAL", skip = 1) %>%
+  select("material" = `Short text`, "harga" = Harga, "tingkat_kekritisan" = `Tingkat kekritisan`, "rutin_nonrutin" = `Rutin/Non Rutin`, Jan:Des, `2014`:`2018`, `2019` = `2019...30`, "ROQ" = ROQ)
+dt2 <- dt2[2:(nrow(dt2)-2),]
+
+dt <- dt2 %>%
+  group_by(material) %>% 
+  distinct(material, .keep_all = T)
+
+str(dt)
+```
+
+The dataset has 1861 observations and 23 variables. 
+
+# 2. Exploratory Data Analysis  
+
+After in the previous stage we can find out the conclusions from each column, then we can further analyze it using exploratory data analysis (EDA) techniques. The purpose of this EDA stage is to be able to find out information more clearly and efficiently through graph plots of the data to be predicted.  
+
+```{r}
+dt2$tingkat_kekritisan <- as.factor(dt2$tingkat_kekritisan)
+dt2$rutin_nonrutin <- as.factor(dt2$rutin_nonrutin)
+dt2$tingkat_kekritisan[dt2$tingkat_kekritisan == "c"]
+dt2 <- dt2 %>%
+  mutate(tingkat_kekritisan =
+           replace(tingkat_kekritisan,
+                   tingkat_kekritisan == "c",
+                   "C"))
+p1a <- ggplot(data=dt2, aes(x = tingkat_kekritisan)) +
+  geom_bar(fill = rainbow(4),
+           color = "blue")+
+  stat_count(geom = "text", color = "black", size = 5,
+             aes(label = ..count..), position=position_stack(vjust = 0.5)) +
+  labs(title = "Plot Tingkat kekritisan")
+p2a <- ggplot(data=dt2, aes(x = rutin_nonrutin)) +
+  geom_bar(fill = rainbow(2),
+           color = "blue")+
+  stat_count(geom = "text", color = "black", size = 5,
+             aes(label = ..count..), position=position_stack(vjust = 0.5)) +
+  labs(title = "Plot Sifat Material")
+
+plot_sifat <- grid.arrange(p1a, p2a, ncol = 2, 
+                           top=textGrob("Plot Material",gp=gpar(fontsize=30,font=3)))
+```
+
+Plot visual data on the classification and properties of materials based on material list data. Seen in the classification of materials, materials with a criticality level of C have a greater number, of which there are 1552 materials and based on their nature, non-routine materials have more quantities than non-routine ones. There are 1789 non-routine materials and 88 routine materials. In 2020, there are 1737 non-routine materials and 88 routine materials.  
+
+# 3. Data Preparation  
+
+After going through the process of cleaning and merging data, the next preprocessing stage is to transform the data. This process is used to convert the previous data format into the desired format in the model.  
+
+```{r}
+yearly <- dt %>%
+  select(material, `2014`:`2019`) %>%
+  pivot_longer(`2014`:`2019`, names_to = "tahun", values_to = "n") %>%
+  mutate(tahun = as.integer(tahun)) %>%
+  arrange(tahun, material) %>%
+  distinct(tahun, material, .keep_all = T) %>%
+  as_tsibble(index = tahun, key = material)
+```
+
+The previous data dimensions totaling 1862 observations and 23 variables divided into 2 data, namely training data and test data. Columns in 2014-2018 were changed to 1 column thereby increasing the total number of observations. The variable n is the value of the rate of use in each year which later this value will be included in the forecasting test. Based on these results, it was found that there were 11166 observations and 3 data variables. The variable consists of the name of the material, the year, and n (the value of the rate of use).  
+
+# 4. Modelling  
+The modeling stage will discuss the model that will be used for forecasting. The transformed material data will be divided first into training data and test data. Training data is data that we build to train the algorithm to make predictions that later the program can read patterns based on the data provided. Test data is data given to test the results of predicted values to measure the accuracy of values based on actual data.
+
+## 4.1 Generate Test Design  
+Training data is the usage rate taken in the 2014-2018 period. As for the test data, the total usage rate will be taken in 2019. After the data is distributed, the total training data consists of 9305 observations and the test data has 1861 observation data.  
+
+```{r}
+# Split training = 6, test = 1 ----
+train_ts <- yearly %>%
+  group_by_key(material) %>%
+  slice(1:5)
+test_ts <- yearly %>%
+  group_by_key(material) %>%
+  slice(6)
+
+train_ts
+test_ts
+```
+
+The transformation of the data entered into the dataframe (yearly) is then divided to determine the training data and test data used for testing. In the training data there are 5 points of request time, while the test data has 1 point of request time.  
+
+## 4.2 Build Model  
+The methods used in this forecasting are Croston method, Syntetos Boyland Approximation, Arima and Exponential Smoothing. These four models will predict the value of training which will automatically learn the pattern of data movement for each material.  
+
+```{r}
+# Fitting Model ----
+model_fit <- train_ts %>%
+  model(
+    croston = CROSTON(n, type = "croston"),
+    sba = CROSTON(n, type = "sba"),
+    arima = ARIMA(n),
+    ets = ETS(n)
+  )
+
+model_fit
+```
+
+It is known that the arima model produces ARIMA(0,0,0) which means that the data has a random walk nature where the variable value generated from time to time does not show a predictive pattern at all. Exponential smoothing produces an ETS(A,N,N) model which means that the data does not have a trend and seasonal level in the data. The model built on Croston and SBA, there are some unpredictable materials that result in (NULL model). This happens because the Croston and SBA methods cannot predict when the use of materials in the 2014-2018 time frame is used for less than 2 years, so the material that cannot be predicted will be defined as (NULL model).
+
+```{r}
+# Filter material dengan nilai null pada semua model ----
+not_null_model <- model_fit %>%
+  filter(!is_null_model(sba) | !is_null_model(croston) | 
+           !is_null_model(arima) | is_null_model(ets))
+
+# Menghitung Akurasi ----
+akurasi <- forecast(not_null_model, h = 2) %>%
+  accuracy(test_ts) %>%
+  select(.model, material, RMSE)
+
+akurasi_summary <- akurasi %>%
+  na.omit() %>%
+  group_by(.model) %>%
+  summarise(RMSE_mean = mean(RMSE))
+
+dt_prep <- dt %>% 
+  select(1, "harga" = 2, "tingkat_kekritisan" = 3, "rutin_nonrutin" = 4, "2019" = 22, "ROQ" = 23)
+```
+It can be concluded that the method produced by ARIMA, Croston, Exponential Smoothing, and SBA has a greater error value than the method used by the company. The method produced by arima has an average error of 10.6 and Exponential Smoothing produces an average error of 22.5, while the average error value for the croston and SBA methods cannot be generated because there are some materials that cannot produce a value. prediction. The method produced by the company itself has a smaller error of 2.07. In this study, the forecasting results from the ARIMA, Croston, Exponential Smoothing, SBA and existing methods will be combined by choosing the method that can produce the smallest error value.
+
+# 5. Evaluation  
+This evaluation consists of an analysis of the calculation of the error value, the value of inventory
+level, service level and warehouse costs based on the existing policy method, analysis method Arima, Exponential Smoothing, Croston, and Syntetos Boyland Approximation.  
+
+```{r}
+# Calculate forecast value ----
+peramalan <- forecast(not_null_model, h = 2)
+
+# Tabel report ----
+t1 <- peramalan %>%
+  as_tibble() %>%
+  filter(tahun == 2020) %>%
+  mutate(prediksi_2020 = paste0(.model, "_", as.character(tahun))) %>%
+  select(material, .mean, prediksi_2020) %>%
+  pivot_wider(names_from = prediksi_2020, values_from = .mean)
+
+t2 <- akurasi %>%
+  select(.model, material, RMSE) %>%
+  pivot_longer(RMSE, names_to = "matriks", values_to = "nilai_akurasi") %>%
+  mutate(model_akurasi = paste0(.model, "_", matriks)) %>%
+  select(material, nilai_akurasi, model_akurasi) %>%
+  pivot_wider(names_from = model_akurasi, values_from = nilai_akurasi)
+
+```
+
+TO get the forecast value, we can enter the results of the model that has been made for each material. in table t1, will display the results of forecasting values for each method used. while for table t2 will display the error value resulting from each method.  
+
+Next we will assume that the model that returns NULL values is 0, because the model cannot generate forecasted values. After that we can also combine the four models used by choosing the smallest error value from each forecasting model and it will be entered into the **optimal method** table.
+
+```{r}
+# Memasukkan 4 model dan memilih model yang terbaik
+## Memasukkan data peramalan yang sudah dibersihkan di Excel
+dt_prep <- read_excel("Data/dt_prep.xlsx")
+
+akurasi2 <- dt_prep %>%
+  select(material, ROQ.e) %>%
+  na.omit() %>%
+  pivot_longer(ROQ.e, names_to = ".model", values_to = "RMSE") %>%
+  bind_rows(akurasi) %>%
+  group_by(.model)
+
+akurasi3 <- akurasi2 %>%
+  group_by(material) %>%
+  slice_min(order_by = RMSE, n = 1)
+
+akurasi2 %>%
+  group_by(material) %>%
+  slice_min(order_by = RMSE, n = 1) %>%
+  ungroup() %>%
+  distinct(material, .keep_all = TRUE) %>%
+  summarise(mean(RMSE))
+
+metode_optimal <- akurasi2 %>%
+  group_by(material) %>%
+  slice_min(order_by = RMSE, n = 1) %>%
+  ungroup() %>%
+  distinct(material, .keep_all = TRUE)
+```
+
+The report table contains the optimal model for forecasting materials. The optimal model is determined based on the smallest error value in each forecast tested based on demand data in 2019. After we combine these 5 methods, we get an average error value of **5.03** points. from the value obtained, it is proven that by combining the 5 models used, it can reduce the error value in the company's material forecast which was previously worth 7,32.  
+
+```{r}
+nilai_3_peramalan <- dt_prep %>%
+  select(material, ROQ) %>%
+  left_join(t1)
+
+nilai_3_peramalan$ROQ <- as.numeric(nilai_3_peramalan$ROQ)
+
+nilai_3_peramalan %>%
+  pivot_longer(cols = 2:6, names_to = ".model", values_to = "nilai_prediksi") %>%
+  right_join(metode_optimal, by = c("material", ".model")) %>%
+  ungroup() %>%
+  arrange(.model)
+
+result_forecast <- nilai_3_peramalan %>%
+  pivot_longer(cols = 2:6, names_to = ".model", values_to = "nilai_prediksi") %>%
+  mutate(
+    .model = str_remove(.model, "_2020"), 
+    .model = str_replace(.model, "ROQ", "ROQ.e")) %>%
+  right_join(metode_optimal, by = c("material", ".model")) %>%
+  ungroup() %>%
+  arrange(.model)
+
+colSums(is.na(result_forecast))
+nrow(nilai_3_peramalan)
+nrow(metode_optimal)
+colSums(is.na(result_forecast))
+
+result_forecast2 <- result_forecast %>%
+  left_join(dt_prep) %>%
+  select(material, harga, tingkat_kekritisan, ROQ, rutin_nonrutin, `2019`,
+         starts_with(".model"), starts_with("nilai_prediksi"))
+
+result_forecast2 <- result_forecast2 %>%
+  mutate(ROQ =
+           replace(ROQ,
+                   is.na(result_forecast2$ROQ),
+                   "0"))
+result_forecast2$ROQ <- as.numeric(result_forecast2$ROQ)
+result_forecast2$harga <- as.numeric(result_forecast2$harga)
+result_forecast2$nilai_prediksi <- ceiling(result_forecast2$nilai_prediksi)
+result_forecast2$ROQ <- ceiling(result_forecast2$ROQ)
+```
+
+The results of the merger will be entered into the **result forecast 2** column to find out the difference in terms of the inventory value that will be ordered by the company in the next period.  
+
+### Inventory Level 
+
+Determining the value of the inventory level will affect the allocation of material storage and also the costs that will be invested in purchasing materials. The less the amount of material ordered, the smaller the cost allocation used. The company targets that the amount of material ordered can be as optimal as possible in order to reduce the value of waste in the warehouse.  
+
+```{r}
+forecast2_arima <- filter(result_forecast2, .model == "arima")
+forecast2_croston <- filter(result_forecast2, .model == "croston")
+forecast2_ets <- filter(result_forecast2, .model == "ets")
+forecast2_sba <- filter(result_forecast2, .model == "sba")
+forecast2_roq <- filter(result_forecast2, .model == "ROQ.e")
+
+sum(result_forecast2$`2019`)
+sum(result_forecast2$ROQ)
+sum(result_forecast2$nilai_prediksi)
+```
+
+The data showing the total material after rounding based on the company's forecasting results and combining 5 methods. The number of materials predicted by the company totaled 17,195 units of material and the forecasting results from the combination of the four methods amounted to 13,346 units of material. In the combination of these 5 methods, there is a percentage decrease in the number of material orders by **22.4%**. It also shows that the company can save the amount of material ordered by **3,849 units**.  
+
+### Material Cost  
+
+Determination of warehouse costs is obtained by multiplying the number of forecasted materials with the price of each material obtained based on data from suppliers. These results will be tested to determine whether the proposed method can minimize the amount of budget allocated to warehousing.  
+
+```{r}
+## Perhitungan Anggaran'
+
+# Anggaran berdasarkan peramalan
+anggaran <- result_forecast2 %>% 
+  mutate(
+    anggaran_by_model = nilai_prediksi * harga,
+    anggaran_by_roq  = ROQ * harga,
+    anggaran_by_2019 = `2019` * harga
+    # anggaran_by_ROQ
+  ) %>% 
+  pivot_longer(
+    starts_with("anggaran_by"), 
+    names_to = "metode_ramalan", 
+    values_to = "hasil_peramalan"
+  ) %>% 
+  group_by(metode_ramalan) %>%
+  summarise(total_anggaran = sum(hasil_peramalan, na.rm = T))
+```
+
+Determination of warehouse costs is obtained by multiplying the number of forecasting materials with the price of each material obtained based on data from suppliers. It is known that the total budget generated by using a combination of 5 methods is Rp.
+35,830,075,396.00 where the budget is smaller than the total budget generated using the existing method of Rp. 36,012,143,757.00. the total savings that can be made by a combination of 5 methods is **Rp. 182,068,361.00**.  
+
+### Service Level  
+Assessment at the service level is measured to determine how effective the forecasting method used to predict the amount of material demand is. The higher the service level value obtained, the better for the company. At this stage, we will create a new column named service level to calculate the value obtained for each material and ensure that there is no NA value.  
+
+```{r}
+# SERVICE LEVEL
+service_level <- read_excel("Data/Data-hasil2 (1).xlsx")
+service_level <- service_level %>%
+  mutate(`service level` =
+           replace(`service level`,
+                   is.na(service_level$`service level`),
+                   "1"))
+
+service_level <- service_level %>%
+  mutate(`service level eksisting` =
+           replace(`service level eksisting`,
+                   is.na(service_level$`service level eksisting`),
+                   "1"))
+
+service_level$`service level` <- as.numeric(service_level$`service level`)
+service_level$`service level eksisting` <- as.numeric(service_level$`service level eksisting`)
+
+# Price for "NA" ==> 0
+service_level$harga[service_level$harga == "NA"]
+service_level <- service_level %>%
+  mutate(harga =
+           replace(harga,
+                   harga == "NA",
+                   0))
+# Criticallity for "NA" ==> 0
+service_level$tingkat_kekritisan[service_level$tingkat_kekritisan == "0"]
+service_level <- service_level %>%
+  mutate(tingkat_kekritisan =
+           replace(tingkat_kekritisan,
+                   tingkat_kekritisan == "0",
+                   "Unavailable"))
+
+colSums(is.na(service_level))
+```
+After make sure that there is no NA value in it, then we can calculate the service level value for each material. we will separate the condition of the material that is overstocked and not so that we can find out whether this new method can reduce the value of overstock or not. service level values that are overstocked will be entered into the **sl_over** table and those that are not included in **sl_target**.    
+```{r}
+sl_target <- filter(service_level,
+                    `service level` <= 1)
+sl_target_eks <- filter(service_level,
+                    `service level eksisting` <= 1)
+
+
+mean(sl_target$`service level`)
+mean(sl_target_eks$`service level eksisting`)
+
+
+service_level <- arrange(service_level, desc(`service level`))
+```
+
+in the result, it can be seen that the combination of 5 methods can produce a service level value of 95.33%. Meanwhile, the company's existing model produces a smaller value, namely 95.06%.  
+
+```{r}
+## Service Level Overstock  
+sl_over <- filter(service_level,
+                 `service level` > 1)
+sl_over_eks <- filter(service_level,
+                  `service level eksisting` > 1)
+mean(sl_over$`service level`)
+mean(sl_over_eks$`service level eksisting`)
+```
+The results show the average material that has overstock through service level values that have a value of more than 100%. The combination of 5 methods has a smaller average of 172.4% while the company's existing model has a larger overstock value of 246.9%. it can be concluded that there is a 75% decrease in the value of overstocked materials.  
+
+# 6. Conclusion  
+
+1. The combination of the 5 methods used can produce a more accurate forecast value for the company. a combination of 5 methods can minimize the percentage error value of **31.3%**.  
+2. The existing method produces an inventory level value of 17,195 material, service level value is 95.06%, and warehouse cost is Rp.36,012,143,757.00. The combination of 5 methods can produce a value of inventory level is 13,346 materials, service level value is 95.33%, and warehouse costs are Rp.35,830,075,396.00. It is known that the combination of 5 methods can reduce the value of inventory level by **22.4%**, increase the value of service level by **0.27%**, and decrease warehouse costs by **0.51%**.  
